@@ -28,17 +28,11 @@ pub struct PietGpuText;
 
 pub struct PietGpuRenderContext {
     encoder: Encoder,
-    // The elements are drawn in a mostly front-to-back order, but the API accepts elements in
-    // back-to-front order instead. Therefore, in each callback we first buffer the commands first,
-    // then reverse it in flush() and store it in elements. In get_scene_buf(), we reverse the order
-    // of element again, therefore the overall drawing order is reversed, but the structure of each
-    // command remains to be the order specified in individual functions.
-    element_tmp: Vec<Element>,
     elements: Vec<Element>,
     // Will probably need direct accesss to hal Device to create images etc.
     inner_text: PietGpuText,
-    stroke_width: Option<f32>,
-    fill_mode: Option<FillMode>,
+    stroke_width: f32,
+    fill_mode: FillMode,
     // We're tallying these cpu-side for expedience, but will probably
     // move this to some kind of readback from element processing.
     /// The count of elements that make it through to coarse rasterization.
@@ -74,7 +68,6 @@ struct ClipElement {
     /// Index of BeginClip element in element vec, for bbox fixup.
     begin_ix: usize,
     bbox: Option<Rect>,
-    encoded_path: Vec<Element>,
 }
 
 #[derive(Clone,Copy,PartialEq)]
@@ -90,16 +83,15 @@ const TOLERANCE: f64 = 0.25;
 impl PietGpuRenderContext {
     pub fn new() -> PietGpuRenderContext {
         let encoder = Encoder::new();
-        let element_tmp = Vec::new();
         let elements = Vec::new();
         let inner_text = PietGpuText;
+        let stroke_width = 0.0;
         PietGpuRenderContext {
             encoder,
-            element_tmp,
             elements,
             inner_text,
-            stroke_width: None,
-            fill_mode: None,
+            stroke_width,
+            fill_mode: FillMode::Nonzero,
             path_count: 0,
             pathseg_count: 0,
             trans_count: 0,
@@ -110,8 +102,6 @@ impl PietGpuRenderContext {
     }
 
     pub fn get_scene_buf(&mut self) -> &[u8] {
-        // TODO: iterator based reverse
-        self.elements.reverse();
         self.elements.encode(&mut self.encoder);
         self.encoder.buf()
     }
@@ -127,19 +117,13 @@ impl PietGpuRenderContext {
     pub fn trans_count(&self) -> usize {
         self.trans_count
     }
-
-    fn flush(&mut self) {
-        self.elements.extend(self.element_tmp.drain(..).rev());
-    }
 }
 
 fn set_fill_mode(ctx: &mut PietGpuRenderContext, fill_mode: FillMode) {
-    if ctx.fill_mode != Some(fill_mode) {
-        if let Some(cur_mode) = ctx.fill_mode {
-            ctx.element_tmp
-                .push(Element::SetFillMode(SetFillMode { fill_mode: cur_mode as u32 }));
-        }
-        ctx.fill_mode = Some(fill_mode);
+    if ctx.fill_mode != fill_mode {
+        ctx.elements
+            .push(Element::SetFillMode(SetFillMode { fill_mode: fill_mode as u32 }));
+        ctx.fill_mode = fill_mode;
     }
 }
 
@@ -165,6 +149,12 @@ impl RenderContext for PietGpuRenderContext {
 
     fn stroke(&mut self, shape: impl Shape, brush: &impl IntoBrush<Self>, width: f64) {
         let width_f32 = width as f32;
+        if self.stroke_width != width_f32 {
+            self.elements
+                .push(Element::SetLineWidth(SetLineWidth { width: width_f32 }));
+            self.stroke_width = width_f32;
+        }
+        set_fill_mode(self, FillMode::Stroke);
         let brush = brush.make_brush(self, || shape.bounding_box()).into_owned();
         match brush {
             PietGpuBrush::Solid(rgba_color) => {
@@ -173,22 +163,11 @@ impl RenderContext for PietGpuRenderContext {
                 let path = shape.path_elements(TOLERANCE);
                 self.encode_path(path, false);
                 let stroke = FillColor { rgba_color };
-                self.element_tmp.push(Element::FillColor(stroke));
+                self.elements.push(Element::FillColor(stroke));
                 self.path_count += 1;
             }
             _ => (),
         }
-        // Push the stroke width for the paths drawn *after* us, not *ours*. The last path is
-        // handled by finish().
-        if self.stroke_width != Some(width_f32) {
-            if let Some(stroke_width) = self.stroke_width {
-                self.element_tmp
-                    .push(Element::SetLineWidth(SetLineWidth { width: stroke_width }));
-            }
-            self.stroke_width = Some(width_f32);
-        }
-        set_fill_mode(self, FillMode::Stroke);
-        self.flush();
     }
 
     fn stroke_styled(
@@ -207,36 +186,32 @@ impl RenderContext for PietGpuRenderContext {
             // Perhaps that should be added to kurbo.
             self.accumulate_bbox(|| shape.bounding_box());
             let path = shape.path_elements(TOLERANCE);
+            set_fill_mode(self, FillMode::Nonzero);
             self.encode_path(path, true);
             let fill = FillColor { rgba_color };
-            self.element_tmp.push(Element::FillColor(fill));
+            self.elements.push(Element::FillColor(fill));
             self.path_count += 1;
-            set_fill_mode(self, FillMode::Nonzero);
         }
-        self.flush();
     }
 
     fn fill_even_odd(&mut self, _shape: impl Shape, _brush: &impl IntoBrush<Self>) {}
 
     fn clip(&mut self, shape: impl Shape) {
+        set_fill_mode(self, FillMode::Nonzero);
         let path = shape.path_elements(TOLERANCE);
         self.encode_path(path, true);
-        let encoded_path = std::mem::take(&mut self.element_tmp);
-        // WARNING: Be careful to not push anything after Element::Clip
         let begin_ix = self.elements.len();
-        self.element_tmp.push(Element::EndClip(Clip {
+        self.elements.push(Element::BeginClip(Clip {
             bbox: Default::default(),
         }));
         self.clip_stack.push(ClipElement {
             bbox: None,
             begin_ix,
-            encoded_path,
         });
         self.path_count += 1;
         if let Some(tos) = self.state_stack.last_mut() {
             tos.n_clip += 1;
         }
-        self.flush();
     }
 
     fn text(&mut self) -> &mut Self::Text {
@@ -251,7 +226,6 @@ impl RenderContext for PietGpuRenderContext {
             transform: self.cur_transform,
             n_clip: 0,
         });
-        self.flush();
         Ok(())
     }
 
@@ -259,7 +233,7 @@ impl RenderContext for PietGpuRenderContext {
         if let Some(state) = self.state_stack.pop() {
             if state.rel_transform != Affine::default() {
                 let a_inv = state.rel_transform.inverse();
-                self.element_tmp
+                self.elements
                     .push(Element::Transform(to_scene_transform(a_inv)));
                 self.trans_count += 1;
             }
@@ -267,7 +241,6 @@ impl RenderContext for PietGpuRenderContext {
             for _ in 0..state.n_clip {
                 self.pop_clip();
             }
-            self.flush();
             Ok(())
         } else {
             Err(Error::StackUnbalance)
@@ -275,17 +248,6 @@ impl RenderContext for PietGpuRenderContext {
     }
 
     fn finish(&mut self) -> Result<(), Error> {
-        if let Some(stroke_width) = self.stroke_width.take() {
-            self.elements
-                .push(Element::SetLineWidth(SetLineWidth { width: stroke_width }));
-        }
-        if let Some(fill_mode) = self.fill_mode.take() {
-            self.elements
-                .push(Element::SetFillMode(SetFillMode { fill_mode: fill_mode as u32 }));
-        }
-        for _ in 0..self.state_stack.len() {
-            self.restore()?;
-        }
         for _ in 0..self.clip_stack.len() {
             self.pop_clip();
         }
@@ -293,14 +255,13 @@ impl RenderContext for PietGpuRenderContext {
     }
 
     fn transform(&mut self, transform: Affine) {
-        self.element_tmp
+        self.elements
             .push(Element::Transform(to_scene_transform(transform)));
         self.trans_count += 1;
         if let Some(tos) = self.state_stack.last_mut() {
             tos.rel_transform *= transform;
         }
         self.cur_transform *= transform;
-        self.flush();
     }
 
     fn make_image(
@@ -345,17 +306,17 @@ impl RenderContext for PietGpuRenderContext {
 
 impl PietGpuRenderContext {
     fn encode_line_seg(&mut self, seg: LineSeg) {
-        self.element_tmp.push(Element::Line(seg));
+        self.elements.push(Element::Line(seg));
         self.pathseg_count += 1;
     }
 
     fn encode_quad_seg(&mut self, seg: QuadSeg) {
-        self.element_tmp.push(Element::Quad(seg));
+        self.elements.push(Element::Quad(seg));
         self.pathseg_count += 1;
     }
 
     fn encode_cubic_seg(&mut self, seg: CubicSeg) {
-        self.element_tmp.push(Element::Cubic(seg));
+        self.elements.push(Element::Cubic(seg));
         self.pathseg_count += 1;
     }
 
@@ -474,20 +435,17 @@ impl PietGpuRenderContext {
         let tos = self.clip_stack.pop().unwrap();
         let bbox = tos.bbox.unwrap_or_default();
         let bbox_f32_4 = rect_to_f32_4(bbox);
-        self.element_tmp.extend(tos.encoded_path);
-        self.element_tmp
-            .push(Element::BeginClip(Clip { bbox: bbox_f32_4 }));
+        self.elements
+            .push(Element::EndClip(Clip { bbox: bbox_f32_4 }));
         self.path_count += 1;
-        if let Element::EndClip(end_clip) = &mut self.elements[tos.begin_ix] {
-            end_clip.bbox = bbox_f32_4;
+        if let Element::BeginClip(begin_clip) = &mut self.elements[tos.begin_ix] {
+            begin_clip.bbox = bbox_f32_4;
         } else {
             unreachable!("expected BeginClip, not found");
         }
-        set_fill_mode(self, FillMode::Nonzero);
         if let Some(bbox) = tos.bbox {
             self.union_bbox(bbox);
         }
-        self.flush();
     }
 
     /// Accumulate a bbox.

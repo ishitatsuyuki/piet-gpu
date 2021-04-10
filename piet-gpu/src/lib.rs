@@ -282,7 +282,7 @@ impl Renderer {
         let bin_base = alloc;
         alloc += ((n_paths + 255) & !255) * BIN_SIZE;
         let ptcl_base = alloc;
-        alloc += WIDTH_IN_TILES * HEIGHT_IN_TILES * PTCL_INITIAL_ALLOC * 2;
+        alloc += WIDTH_IN_TILES * HEIGHT_IN_TILES * PTCL_INITIAL_ALLOC;
         let pathseg_base = alloc;
         alloc += (n_pathseg * PATHSEG_SIZE + 3) & !3;
         let anno_base = alloc;

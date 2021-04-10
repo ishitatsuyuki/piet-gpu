@@ -26,12 +26,12 @@ layout(set = 0, binding = 1) readonly buffer ConfigBuf {
 
 layout(rgba8, set = 0, binding = 2) uniform writeonly image2D image;
 
-layout(r32ui, set = 0, binding = 3) uniform uimage2D winding_lut;
+layout(r32ui, set = 0, binding = 3) uniform readonly uimage2D winding_lut;
 
 #if GL_EXT_nonuniform_qualifier
-layout(rgba8, set = 0, binding = 3) uniform readonly image2D images[];
+layout(rgba8, set = 0, binding = 4) uniform readonly image2D images[];
 #else
-layout(rgba8, set = 0, binding = 3) uniform readonly image2D images[1];
+layout(rgba8, set = 0, binding = 4) uniform readonly image2D images[1];
 #endif
 
 #include "ptcl.h"
@@ -145,28 +145,32 @@ void main() {
     }
 
     uint tile_ix = gl_WorkGroupID.y * conf.width_in_tiles + gl_WorkGroupID.x;
-    Alloc cmd_alloc = slice_mem(conf.ptcl_alloc, tile_ix * PTCL_INITIAL_ALLOC * 2, PTCL_INITIAL_ALLOC);
+    Alloc cmd_alloc = slice_mem(conf.ptcl_alloc, tile_ix * PTCL_INITIAL_ALLOC, PTCL_INITIAL_ALLOC);
     CmdRef cmd_ref = CmdRef(cmd_alloc.offset);
 
     uvec2 xy_uint = uvec2(gl_LocalInvocationID.x + TILE_WIDTH_PX * gl_WorkGroupID.x, gl_LocalInvocationID.y + TILE_HEIGHT_PX * gl_WorkGroupID.y);
     vec2 xy = vec2(xy_uint);
-    vec3 rgb[CHUNK];
+    vec3 rgb_fg[CHUNK];
+    vec3 rgb_bg[CHUNK];
+    bool use_ss[CHUNK];
+    uint fg_coverage[CHUNK];
     uint stencil[CHUNK];
     uint coverage[CHUNK];
     uint stencil_stack[256][CHUNK];
     uint clip_depth = 0;
-    uint alpha_stencil_stack[256][CHUNK];
-    uint alpha_depth = 0;
 
     Alloc clip_tos = new_alloc(0, 0);
     for (uint i = 0; i < CHUNK; i++) {
-        rgb[i] = vec3(0.0);
+        rgb_fg[i] = vec3(0.5);
+        rgb_bg[i] = vec3(0.0);
 #ifdef ENABLE_IMAGE_INDICES
         if (xy_uint.x < 1024 && xy_uint.y < 1024) {
-            // rgb[i] = imageLoad(images[gl_WorkGroupID.x / 64], ivec2(xy_uint.x, xy_uint.y + CHUNK_DY * i)/4).rgb;
+            rgb_fg[i] = imageLoad(images[gl_WorkGroupID.x / 64], ivec2(xy_uint + chunk_offset(i))/4).rgb;
         }
 #endif
         stencil[i] = 0;
+        fg_coverage[i] = ~0u;
+        use_ss[i] = false;
     }
 
     float area[CHUNK];
@@ -250,14 +254,19 @@ void main() {
             CmdColor color = Cmd_Color_read(cmd_alloc, cmd_ref);
             vec4 fg = unpacksRGB(color.rgba_color);
             for (uint k = 0; k < CHUNK; k++) {
-                float area = float(bitCount(coverage[k] & ~stencil[k])) / 32.;
-                if (fg.a == 1.0) {
-                    rgb[k] = rgb[k] + fg.rgb * area;
-                    // only update stencil if opaque
-                    stencil[k] |= coverage[k];
-                } else {
-                    vec4 fg_k = fg * area;
-                    rgb[k] = rgb[k] * (1.0 - fg_k.a) + fg_k.rgb;
+                uint to_update = coverage[k] & ~stencil[k];
+                if (!use_ss[k]) {
+                    if ((~to_update & ~fg_coverage[k]) == 0u) {
+                        // Current fill completely covers the background
+                        fg_coverage[k] = ~to_update;
+                        rgb_bg[k] = rgb_bg[k] * (1.0 - fg.a) + fg.rgb;
+                    } else if ((~to_update & fg_coverage[k]) == 0u) {
+                        // Current fill completely covers the foreground
+                        fg_coverage[k] = to_update;
+                        rgb_fg[k] = rgb_fg[k] * (1.0 - fg.a) + fg.rgb;
+                    } else {
+                        use_ss[k] = true;
+                    }
                 }
             }
             cmd_ref.offset += 4 + CmdColor_size;
@@ -265,11 +274,7 @@ void main() {
         case Cmd_Image:
             CmdImage fill_img = Cmd_Image_read(cmd_alloc, cmd_ref);
             vec4 img[CHUNK] = fillImage(xy_uint, fill_img);
-            for (uint k = 0; k < CHUNK; k++) {
-                float area = float(bitCount(coverage[k] & ~stencil[k])) / 32.;
-                vec4 fg_k = img[k] * area;
-                rgb[k] = rgb[k] * (1.0 - fg_k.a) + fg_k.rgb;
-            }
+            // TODO
             cmd_ref.offset += 4 + CmdImage_size;
             break;
         case Cmd_BeginClip:
@@ -287,20 +292,6 @@ void main() {
             }
             cmd_ref.offset += 4;
             break;
-        case Cmd_SaveStencil:
-            for (uint k = 0; k < CHUNK; k++) {
-                alpha_stencil_stack[alpha_depth][k] = stencil[k];
-            }
-            alpha_depth++;
-            cmd_ref.offset += 4;
-            break;
-        case Cmd_RestoreStencil:
-            alpha_depth--;
-            for (uint k = 0; k < CHUNK; k++) {
-                stencil[k] = alpha_stencil_stack[alpha_depth][k];
-            }
-            cmd_ref.offset += 4;
-            break;
         case Cmd_Jump:
             cmd_ref = CmdRef(Cmd_Jump_read(cmd_alloc, cmd_ref).new_ref);
             cmd_alloc.offset = cmd_ref.offset;
@@ -309,6 +300,12 @@ void main() {
     }
 
     for (uint i = 0; i < CHUNK; i++) {
-        imageStore(image, ivec2(xy_uint + chunk_offset(i)), vec4(tosRGB(rgb[i]), 1.0));
+        vec3 rgb;
+        if (!use_ss[i]) {
+            rgb = mix(rgb_bg[i], rgb_fg[i], bitCount(fg_coverage[i]) / 32.);
+        } else {
+            rgb = vec3(0., 0., 1.);
+        }
+        imageStore(image, ivec2(xy_uint + chunk_offset(i)), vec4(tosRGB(rgb), 1.0));
     }
 }

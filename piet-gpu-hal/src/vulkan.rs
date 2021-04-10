@@ -1052,6 +1052,7 @@ impl crate::PipelineBuilder<VkDevice> for PipelineBuilder {
                             .stage(vk::ShaderStageFlags::COMPUTE)
                             .module(compute_shader_module)
                             .name(&entry_name)
+                            .push_next(&mut vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::builder().required_subgroup_size(32))
                             .build(),
                     )
                     .layout(pipeline_layout)

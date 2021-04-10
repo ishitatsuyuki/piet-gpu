@@ -34,8 +34,6 @@ piet_gpu! {
             BeginClip,
             EndClip,
             Jump(CmdJump),
-            SaveStencil,
-            RestoreStencil,
         }
     }
 }
