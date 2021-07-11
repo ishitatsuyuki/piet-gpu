@@ -158,13 +158,12 @@ void main() {
             // Calculate coverage based on backdrop + coverage of each line segment
             do {
                 TileSeg seg = TileSeg_read(new_alloc(tile_seg_ref.offset, TileSeg_size, mem_ok), tile_seg_ref);
-                float a1;
                 int yi;
-                if (i < TILE_WIDTH_PX) {
+                if (i < TILE_WIDTH_PX && seg.vector.x != 0) {
                     vec2 start = seg.origin - tile_xy - vec2(i, 0);
                     vec2 end = start + seg.vector;
                     vec2 window = clamp(vec2(start.x, end.x), 0., 1.);
-                    vec2 t = (window - start.x + 1e-6) / (seg.vector.x + 1e-6);
+                    vec2 t = (window - start.x) / seg.vector.x;
                     vec2 ys = vec2(mix(start.y, end.y, t.x), mix(start.y, end.y, t.y));
                     yi = int(floor(ys.x));
                     if (!(start.x >= 0. && start.x < 1.) // Reject the pixel containing the start point since it's also calculated in the horizontal intersection pass
@@ -177,11 +176,11 @@ void main() {
                         atomicAdd(cov[i+1][yi], -int((y1 - ys.x) * (0.5 * (x1 + window.x)) * 65536.));
                     }
                 }
-                if (i < TILE_HEIGHT_PX) {
+                if (i < TILE_HEIGHT_PX && seg.vector.y != 0) {
                     vec2 start = seg.origin - tile_xy - vec2(0, i);
                     vec2 end = start + seg.vector;
                     vec2 window = clamp(vec2(start.y, end.y), 0., 1.);
-                    vec2 t = (window - start.y + 1e-6) / (seg.vector.y + 1e-6);
+                    vec2 t = (window - start.y) / seg.vector.y;
                     vec2 xs = vec2(mix(start.x, end.x, t.x), mix(start.x, end.x, t.y));
                     int xi = int(floor(xs.x));
                     xs -= floor(xs.x);
