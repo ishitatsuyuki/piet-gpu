@@ -15,12 +15,9 @@
 #include "mem.h"
 #include "setup.h"
 
-#define CHUNK_X 2
-#define CHUNK_Y 4
-#define CHUNK CHUNK_X * CHUNK_Y
-#define CHUNK_DX (TILE_WIDTH_PX / CHUNK_X)
-#define CHUNK_DY (TILE_HEIGHT_PX / CHUNK_Y)
-layout(local_size_x = CHUNK_DX, local_size_y = CHUNK_DY) in;
+#define CHUNK 4
+#define CHUNK_DX (TILE_WIDTH_PX / CHUNK)
+layout(local_size_x = CHUNK_DX, local_size_y = TILE_HEIGHT_PX) in;
 
 layout(set = 0, binding = 1) restrict readonly buffer ConfigBuf {
     Config conf;
@@ -36,6 +33,8 @@ layout(rgba8, set = 0, binding = 3) uniform restrict readonly image2D images[1];
 
 #include "ptcl.h"
 #include "tile.h"
+
+shared int cov[TILE_WIDTH_PX+1][TILE_HEIGHT_PX+1]; // +1 to cut down on bank conflicts, as well as to save a branch in the code
 
 #define MAX_BLEND_STACK 128
 mediump vec3 tosRGB(mediump vec3 rgb) {
@@ -67,7 +66,7 @@ uint packsRGB(mediump vec4 rgba) {
 }
 
 uvec2 chunk_offset(uint i) {
-    return uvec2(i % CHUNK_X * CHUNK_DX, i / CHUNK_X * CHUNK_DY);
+    return uvec2(i * CHUNK_DX, 0);
 }
 
 mediump vec4[CHUNK] fillImage(uvec2 xy, CmdImage cmd_img) {
@@ -145,33 +144,72 @@ void main() {
             break;
         case Cmd_Fill:
             CmdFill fill = Cmd_Fill_read(cmd_alloc, cmd_ref);
-            for (uint k = 0; k < CHUNK; k++) area[k] = float(fill.backdrop);
+            uint i = gl_LocalInvocationIndex;
+            uvec2 tile_xy = uvec2(TILE_WIDTH_PX * gl_WorkGroupID.x, TILE_HEIGHT_PX * gl_WorkGroupID.y);
+            for (uint k = 0; k < CHUNK; k++) {
+                uvec2 my_xy = uvec2(gl_LocalInvocationID.xy) + chunk_offset(k);
+                cov[my_xy.x][my_xy.y] = 0;
+            }
+            barrier();
+            if (i < TILE_HEIGHT_PX) {
+                atomicAdd(cov[0][i], fill.backdrop * 65536);
+            }
             tile_seg_ref = TileSegRef(fill.tile_ref);
             // Calculate coverage based on backdrop + coverage of each line segment
             do {
                 TileSeg seg = TileSeg_read(new_alloc(tile_seg_ref.offset, TileSeg_size, mem_ok), tile_seg_ref);
-                for (uint k = 0; k < CHUNK; k++) {
-                    vec2 my_xy = xy + vec2(chunk_offset(k));
-                    vec2 start = seg.origin - my_xy;
+                float a1;
+                int yi;
+                if (i < TILE_WIDTH_PX) {
+                    vec2 start = seg.origin - tile_xy - vec2(i, 0);
                     vec2 end = start + seg.vector;
-                    vec2 window = clamp(vec2(start.y, end.y), 0.0, 1.0);
-                    if (window.x != window.y) {
-                        vec2 t = (window - start.y) / seg.vector.y;
-                        vec2 xs = vec2(mix(start.x, end.x, t.x), mix(start.x, end.x, t.y));
-                        float xmin = min(min(xs.x, xs.y), 1.0) - 1e-6;
-                        float xmax = max(xs.x, xs.y);
-                        float b = min(xmax, 1.0);
-                        float c = max(b, 0.0);
-                        float d = max(xmin, 0.0);
-                        float a = (b + 0.5 * (d * d - c * c) - xmin) / (xmax - xmin);
-                        area[k] += a * (window.x - window.y);
+                    vec2 window = clamp(vec2(start.x, end.x), 0., 1.);
+                    vec2 t = (window - start.x + 1e-6) / (seg.vector.x + 1e-6);
+                    vec2 ys = vec2(mix(start.y, end.y, t.x), mix(start.y, end.y, t.y));
+                    yi = int(floor(ys.x));
+                    if (!(start.x >= 0. && start.x < 1.) // Reject the pixel containing the start point since it's also calculated in the horizontal intersection pass
+                      && yi >= 0 && yi < TILE_HEIGHT_PX) { // TODO: optimize with (yi & ~TILE_HEIGHT_PX) == 0?
+                        ys -= floor(ys.x);
+                        float y1 = clamp(ys.y, 0., 1.);
+                        float t1 = (y1 - ys.x + 1e-6) / (ys.y - ys.x + 1e-6);
+                        float x1 = mix(window.x, window.y, t1);
+                        atomicAdd(cov[i][yi], -int((y1 - ys.x) * (1. - 0.5 * (x1 + window.x)) * 65536.));
+                        atomicAdd(cov[i+1][yi], -int((y1 - ys.x) * (0.5 * (x1 + window.x)) * 65536.));
                     }
-                    area[k] += sign(seg.vector.x) * clamp(my_xy.y - seg.y_edge + 1.0, 0.0, 1.0);
+                }
+                if (i < TILE_HEIGHT_PX) {
+                    vec2 start = seg.origin - tile_xy - vec2(0, i);
+                    vec2 end = start + seg.vector;
+                    vec2 window = clamp(vec2(start.y, end.y), 0., 1.);
+                    vec2 t = (window - start.y + 1e-6) / (seg.vector.y + 1e-6);
+                    vec2 xs = vec2(mix(start.x, end.x, t.x), mix(start.x, end.x, t.y));
+                    int xi = int(floor(xs.x));
+                    xs -= floor(xs.x);
+                    float x1 = clamp(xs.y, 0., 1.);
+                    float t1 = (x1 - xs.x + 1e-6) / (xs.y - xs.x + 1e-6);
+                    float y1 = mix(window.x, window.y, t1);
+                    atomicAdd(cov[clamp(xi, 0, TILE_WIDTH_PX)][i], -int((y1 - window.x) * (1. - 0.5 * (x1 + xs.x)) * 65536.));
+                    atomicAdd(cov[clamp(xi+1, 0, TILE_WIDTH_PX)][i], -int((y1 - window.x) * (0.5 * (x1 + xs.x)) * 65536.));
+                }
+                if (i < TILE_HEIGHT_PX) {
+                    atomicAdd(cov[0][i], int(sign(seg.vector.x) * clamp(tile_xy.y + float(i) - seg.y_edge + 1.0, 0.0, 1.0) * 65536.));
                 }
                 tile_seg_ref = seg.next;
             } while (tile_seg_ref.offset != 0);
+            barrier();
+            // "dumb" prefix sum for now
+            if (i < TILE_HEIGHT_PX) {
+                int sum = 0;
+                for (int j = 0; j < TILE_WIDTH_PX; j++) {
+                    // The "dumb" prefix sum is barrier free
+                    sum += cov[j][i];
+                    cov[j][i] = sum;
+                }
+            }
+            barrier();
             for (uint k = 0; k < CHUNK; k++) {
-                area[k] = min(abs(area[k]), 1.0);
+                uvec2 my_xy = uvec2(gl_LocalInvocationID.xy) + chunk_offset(k);
+                area[k] = min(abs(cov[my_xy.x][my_xy.y] / 65536.), 1.0);
             }
             cmd_ref.offset += 4 + CmdFill_size;
             break;
