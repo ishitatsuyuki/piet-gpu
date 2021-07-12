@@ -11,6 +11,8 @@
 #ifdef ENABLE_IMAGE_INDICES
 #extension GL_EXT_nonuniform_qualifier : enable
 #endif
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
 
 #include "mem.h"
 #include "setup.h"
@@ -197,19 +199,21 @@ void main() {
                 tile_seg_ref = seg.next;
             } while (tile_seg_ref.offset != 0);
             barrier();
-            // "dumb" prefix sum for now
-            if (i < TILE_HEIGHT_PX) {
-                int sum = 0;
-                for (int j = 0; j < TILE_WIDTH_PX; j++) {
-                    // The "dumb" prefix sum is barrier free
-                    sum += cov[j][i];
-                    cov[j][i] = sum;
-                }
-            }
-            barrier();
+            int carry = 0;
             for (uint k = 0; k < CHUNK; k++) {
                 uvec2 my_xy = uvec2(gl_LocalInvocationID.xy) + chunk_offset(k);
-                area[k] = min(abs(cov[my_xy.x][my_xy.y] / 65536.), 1.0);
+                int val = cov[my_xy.x][my_xy.y];
+                int local_sum = val;
+                int acc = carry + val;
+                for (uint i = 1; i < CHUNK_DX; i *= 2) {
+                    int shuf = subgroupShuffleXor(local_sum, i);
+                    if ((gl_LocalInvocationID.x & i) != 0) {
+                        acc += shuf;
+                    }
+                    local_sum += shuf;
+                }
+                area[k] = min(abs(acc / 65536.), 1.0);
+                carry += local_sum;
             }
             cmd_ref.offset += 4 + CmdFill_size;
             break;
