@@ -166,7 +166,7 @@ void main() {
                     vec2 end = start + seg.vector;
                     vec2 window = clamp(vec2(start.x, end.x), 0., 1.);
                     vec2 t = (window - start.x) / seg.vector.x;
-                    vec2 ys = vec2(mix(start.y, end.y, t.x), mix(start.y, end.y, t.y));
+                    vec2 ys = start.y + t * seg.vector.y;
                     float f = seg.vector.x * seg.vector.y > 0 ? ceil(ys.x) - 1 : floor(ys.x);
                     yi = int(f);
                     if (!(start.x >= 0. && start.x < 1.) // Reject the pixel containing the start point since it's also calculated in the horizontal intersection pass
@@ -184,7 +184,7 @@ void main() {
                     vec2 end = start + seg.vector;
                     vec2 window = clamp(vec2(start.y, end.y), 0., 1.);
                     vec2 t = (window - start.y) / seg.vector.y;
-                    vec2 xs = vec2(mix(start.x, end.x, t.x), mix(start.x, end.x, t.y));
+                    vec2 xs = start.x + t * seg.vector.x;
                     int xi = int(floor(xs.x));
                     xs -= floor(xs.x);
                     float x1 = clamp(xs.y, 0., 1.);
