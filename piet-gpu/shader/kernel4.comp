@@ -36,7 +36,7 @@ layout(rgba8, set = 0, binding = 3) uniform restrict readonly image2D images[1];
 #include "ptcl.h"
 #include "tile.h"
 
-shared int cov[TILE_WIDTH_PX+1][TILE_HEIGHT_PX+1]; // +1 to cut down on bank conflicts, as well as to save a branch in the code
+shared int cov[TILE_WIDTH_PX+1][TILE_HEIGHT_PX]; // +1 as we put the "correction" winding to the right of each target tile
 
 #define MAX_BLEND_STACK 128
 mediump vec3 tosRGB(mediump vec3 rgb) {
